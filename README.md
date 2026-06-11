@@ -26,7 +26,16 @@ Hoac double click `run_voice_studio.bat` tren Windows.
 - Bat `Auto play` de nghe ngay sau khi generate xong.
 - Bam `Play` de nghe lai file output hien tai.
 - Bam `Pause` / `Stop` de dieu khien playback trong app.
+- Bam `Preview Voice` de nghe nhanh giong dang chon voi cau mau ngan.
 - Bam `Open Folder` de mo thu muc chua file audio.
+
+## Voice va export
+
+- `Favorite Voice` luu giong doc yeu thich theo tung provider va dua len dau danh sach khi mo lai.
+- `Format` cho phep giu dinh dang mac dinh cua provider hoac xuat MP3/WAV/OGG.
+- `Bitrate` ap dung cho MP3/OGG khi dung ffmpeg.
+- `Merge text lines` render tung dong khong rong thanh mot doan rieng roi ghep thanh mot file.
+- Doi dinh dang va ghep nhieu doan can `ffmpeg` co trong PATH.
 
 ## Workflow nang cao
 

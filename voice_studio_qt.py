@@ -1,6 +1,9 @@
 import json
-import os
+import shutil
+import subprocess
 import sys
+import tempfile
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -8,6 +11,7 @@ from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QFont
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -38,6 +42,9 @@ from voice_studio import APP_DIR, DEFAULT_TEXT, PROVIDERS, Field, Provider, clea
 
 HISTORY_FILE = APP_DIR / "voice_studio_history.json"
 PRESET_FILE = APP_DIR / "voice_studio_presets.json"
+FAVORITES_FILE = APP_DIR / "voice_studio_favorites.json"
+PREVIEW_TEXT = "Xin chao, day la ban nghe thu giong doc."
+EXPORT_FORMATS = ("Provider default", "MP3", "WAV", "OGG")
 
 
 PROVIDER_NOTES = {
@@ -55,33 +62,140 @@ class GenerateWorker(QThread):
     finished_ok = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, provider: Provider, text: str, output: Path, options: dict[str, object]) -> None:
+    def __init__(
+        self,
+        provider: Provider,
+        text: str,
+        output: Path,
+        options: dict[str, object],
+        export_format: str = "Provider default",
+        bitrate: str = "Auto",
+        merge_segments: bool = False,
+    ) -> None:
         super().__init__()
         self.provider = provider
         self.text = text
         self.output = output
         self.options = options
+        self.export_format = export_format
+        self.bitrate = bitrate
+        self.merge_segments = merge_segments
 
     def run(self) -> None:
         try:
             self.log.emit(f"Start: {self.provider.name} -> {self.output}")
-            self.provider.synthesize(self.text, self.output, self.options)
-            self.finished_ok.emit(str(self.output))
+            final_output = synthesize_export(
+                self.provider,
+                self.text,
+                self.output,
+                self.options,
+                self.export_format,
+                self.bitrate,
+                self.merge_segments,
+                self.log.emit,
+            )
+            self.finished_ok.emit(str(final_output))
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+def text_segments(text: str) -> list[str]:
+    segments = [clean_text(line) for line in text.splitlines() if clean_text(line)]
+    return segments or [clean_text(text)]
+
+
+def export_suffix(export_format: str, provider: Provider) -> str:
+    if export_format == "Provider default":
+        return provider.extension
+    return f".{export_format.lower()}"
+
+
+def ffmpeg_path() -> str | None:
+    return shutil.which("ffmpeg")
+
+
+def convert_audio(source: Path, target: Path, bitrate: str, log: Callable[[str], None] | None = None) -> None:
+    ffmpeg = ffmpeg_path()
+    if not ffmpeg:
+        raise RuntimeError("Can ffmpeg de xuat/doi dinh dang MP3/WAV/OGG hoac ghep nhieu doan.")
+    command = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(source)]
+    if bitrate != "Auto" and target.suffix.lower() in {".mp3", ".ogg"}:
+        command.extend(["-b:a", bitrate])
+    command.append(str(target))
+    if log:
+        log(f"Convert: {source.name} -> {target.name}")
+    subprocess.run(command, check=True)
+
+
+def concat_audio(sources: list[Path], target: Path, bitrate: str, log: Callable[[str], None] | None = None) -> None:
+    ffmpeg = ffmpeg_path()
+    if not ffmpeg:
+        raise RuntimeError("Can ffmpeg de ghep nhieu doan audio.")
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as concat_file:
+        concat_path = Path(concat_file.name)
+        for source in sources:
+            escaped = source.as_posix().replace("'", "'\\''")
+            concat_file.write(f"file '{escaped}'\n")
+    try:
+        command = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(concat_path)]
+        if bitrate != "Auto" and target.suffix.lower() in {".mp3", ".ogg"}:
+            command.extend(["-b:a", bitrate])
+        command.append(str(target))
+        if log:
+            log(f"Merge: {len(sources)} segments -> {target.name}")
+        subprocess.run(command, check=True)
+    finally:
+        concat_path.unlink(missing_ok=True)
+
+
+def synthesize_export(
+    provider: Provider,
+    text: str,
+    output: Path,
+    options: dict[str, object],
+    export_format: str,
+    bitrate: str,
+    merge_segments: bool,
+    log: Callable[[str], None] | None = None,
+) -> Path:
+    output = output.with_suffix(export_suffix(export_format, provider))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    needs_convert = output.suffix.lower() != provider.extension.lower()
+    segments = text_segments(text) if merge_segments else [text]
+    if len(segments) == 1 and not needs_convert:
+        provider.synthesize(segments[0], output, options)
+        return output
+
+    with tempfile.TemporaryDirectory(prefix="voice_studio_") as temp_dir:
+        temp_root = Path(temp_dir)
+        segment_files: list[Path] = []
+        for index, segment in enumerate(segments, start=1):
+            segment_file = temp_root / f"segment_{index:03d}{provider.extension}"
+            if log and len(segments) > 1:
+                log(f"Render segment {index}/{len(segments)}")
+            provider.synthesize(segment, segment_file, options)
+            segment_files.append(segment_file)
+
+        if len(segment_files) > 1:
+            concat_audio(segment_files, output, bitrate, log)
+        else:
+            convert_audio(segment_files[0], output, bitrate, log)
+        return output
 
 
 class VoiceStudioQt(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Voice Studio Pro")
-        self.resize(1180, 760)
-        self.setMinimumSize(980, 640)
+        self.resize(1220, 780)
+        self.setMinimumSize(1040, 680)
 
         self.providers = {provider.name: provider for provider in PROVIDERS}
         self.field_widgets: dict[str, QWidget] = {}
         self.worker: GenerateWorker | None = None
+        self.preview_worker: GenerateWorker | None = None
         self.last_output: Path | None = None
+        self.preview_output: Path | None = None
 
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
@@ -105,8 +219,8 @@ class VoiceStudioQt(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         main = QVBoxLayout(root)
-        main.setContentsMargins(22, 18, 22, 18)
-        main.setSpacing(14)
+        main.setContentsMargins(20, 16, 20, 14)
+        main.setSpacing(12)
 
         header = QHBoxLayout()
         title_box = QVBoxLayout()
@@ -121,7 +235,8 @@ class VoiceStudioQt(QMainWindow):
         self.provider_combo = QComboBox()
         self.provider_combo.addItems(self.providers.keys())
         self.provider_combo.currentTextChanged.connect(self._on_provider_changed)
-        self.provider_combo.setMinimumWidth(290)
+        self.provider_combo.setMinimumWidth(300)
+        self.provider_combo.setFixedHeight(34)
         header.addWidget(self.provider_combo)
         main.addLayout(header)
 
@@ -131,8 +246,8 @@ class VoiceStudioQt(QMainWindow):
 
         left = self._panel()
         left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(18, 16, 18, 16)
-        left_layout.setSpacing(12)
+        left_layout.setContentsMargins(16, 14, 16, 14)
+        left_layout.setSpacing(11)
         text_header = QHBoxLayout()
         text_label = QLabel("Text")
         text_label.setObjectName("SectionTitle")
@@ -148,18 +263,47 @@ class VoiceStudioQt(QMainWindow):
         self.text_edit.textChanged.connect(self._update_metrics)
         self.text_edit.setAcceptRichText(False)
         self.text_edit.setPlaceholderText("Nhap noi dung can tao voice...")
+        self.text_edit.setMinimumHeight(235)
         left_layout.addWidget(self.text_edit, 1)
 
         output_row = QHBoxLayout()
+        output_row.setSpacing(10)
         self.output_edit = QLineEdit(str(APP_DIR / f"voice_output{self._current_provider().extension}"))
         browse_output = QPushButton("Browse")
         browse_output.clicked.connect(self._browse_output)
-        output_row.addWidget(QLabel("Output"))
+        output_label = QLabel("Output")
+        output_label.setObjectName("FieldLabel")
+        output_label.setFixedWidth(48)
+        output_row.addWidget(output_label)
         output_row.addWidget(self.output_edit, 1)
         output_row.addWidget(browse_output)
         left_layout.addLayout(output_row)
 
+        export_row = QHBoxLayout()
+        export_row.setSpacing(10)
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(EXPORT_FORMATS)
+        self.format_combo.currentTextChanged.connect(self._on_export_format_changed)
+        self.format_combo.setMinimumWidth(150)
+        self.bitrate_combo = QComboBox()
+        self.bitrate_combo.addItems(("Auto", "64k", "96k", "128k", "192k", "256k", "320k"))
+        self.bitrate_combo.setMinimumWidth(88)
+        self.merge_segments_check = QCheckBox("Merge text lines")
+        format_label = QLabel("Format")
+        format_label.setObjectName("FieldLabel")
+        format_label.setFixedWidth(48)
+        bitrate_label = QLabel("Bitrate")
+        bitrate_label.setObjectName("FieldLabel")
+        export_row.addWidget(format_label)
+        export_row.addWidget(self.format_combo)
+        export_row.addWidget(bitrate_label)
+        export_row.addWidget(self.bitrate_combo)
+        export_row.addWidget(self.merge_segments_check)
+        export_row.addStretch()
+        left_layout.addLayout(export_row)
+
         controls = QHBoxLayout()
+        controls.setSpacing(10)
         self.auto_play_check = QCheckBox("Auto play")
         self.auto_play_check.setChecked(True)
         self.generate_button = QPushButton("Generate Voice")
@@ -190,44 +334,64 @@ class VoiceStudioQt(QMainWindow):
         right_layout.setSpacing(12)
 
         provider_panel = self._panel()
+        provider_panel.setMinimumHeight(260)
         provider_layout = QVBoxLayout(provider_panel)
-        provider_layout.setContentsMargins(16, 14, 16, 14)
-        provider_layout.setSpacing(10)
+        provider_layout.setContentsMargins(14, 12, 14, 14)
+        provider_layout.setSpacing(8)
         provider_header = QHBoxLayout()
         provider_title = QLabel("Provider Settings")
         provider_title.setObjectName("SectionTitle")
+        provider_header.addWidget(provider_title)
+        provider_header.addStretch()
+
+        provider_actions = QHBoxLayout()
+        provider_actions.setSpacing(8)
         save_preset = QToolButton()
         save_preset.setText("Save Preset")
         save_preset.clicked.connect(self._save_provider_preset)
         load_preset = QToolButton()
         load_preset.setText("Load Preset")
         load_preset.clicked.connect(self._load_provider_preset)
-        provider_header.addWidget(provider_title)
-        provider_header.addStretch()
-        provider_header.addWidget(save_preset)
-        provider_header.addWidget(load_preset)
+        self.preview_voice_button = QToolButton()
+        self.preview_voice_button.setText("Preview Voice")
+        self.preview_voice_button.clicked.connect(self._preview_voice)
+        self.favorite_voice_button = QToolButton()
+        self.favorite_voice_button.setText("Favorite Voice")
+        self.favorite_voice_button.clicked.connect(self._toggle_favorite_voice)
+        provider_actions.addWidget(self.preview_voice_button)
+        provider_actions.addWidget(self.favorite_voice_button)
+        provider_actions.addWidget(save_preset)
+        provider_actions.addWidget(load_preset)
+        provider_actions.addStretch()
         self.provider_note = QLabel("")
         self.provider_note.setObjectName("Muted")
         self.provider_note.setWordWrap(True)
         provider_layout.addLayout(provider_header)
+        provider_layout.addLayout(provider_actions)
         provider_layout.addWidget(self.provider_note)
 
         self.options_container = QWidget()
+        self.options_container.setObjectName("OptionsContainer")
         self.options_grid = QGridLayout(self.options_container)
-        self.options_grid.setContentsMargins(0, 8, 0, 0)
-        self.options_grid.setHorizontalSpacing(10)
-        self.options_grid.setVerticalSpacing(9)
+        self.options_grid.setContentsMargins(0, 8, 8, 0)
+        self.options_grid.setHorizontalSpacing(12)
+        self.options_grid.setVerticalSpacing(10)
         self.options_grid.setColumnStretch(1, 1)
         options_scroll = QScrollArea()
+        options_scroll.setObjectName("OptionsScroll")
         options_scroll.setWidgetResizable(True)
         options_scroll.setFrameShape(QFrame.NoFrame)
+        options_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        options_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         options_scroll.setWidget(self.options_container)
+        options_scroll.setMinimumHeight(155)
         provider_layout.addWidget(options_scroll, 1)
-        right_layout.addWidget(provider_panel, 3)
+        right_layout.addWidget(provider_panel, 4)
 
         history_panel = self._panel()
         history_layout = QVBoxLayout(history_panel)
-        history_layout.setContentsMargins(16, 14, 16, 14)
+        history_layout.setContentsMargins(14, 12, 14, 14)
+        history_layout.setSpacing(8)
         history_title = QHBoxLayout()
         history_label = QLabel("History")
         history_label.setObjectName("SectionTitle")
@@ -244,11 +408,12 @@ class VoiceStudioQt(QMainWindow):
         right_layout.addWidget(history_panel, 2)
 
         splitter.addWidget(right)
-        splitter.setSizes([720, 420])
+        splitter.setSizes([700, 480])
 
         bottom = self._panel()
         bottom_layout = QVBoxLayout(bottom)
         bottom_layout.setContentsMargins(14, 10, 14, 10)
+        bottom_layout.setSpacing(8)
         log_header = QHBoxLayout()
         log_label = QLabel("Log")
         log_label.setObjectName("SectionTitle")
@@ -260,7 +425,7 @@ class VoiceStudioQt(QMainWindow):
         bottom_layout.addLayout(log_header)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMaximumHeight(125)
+        self.log.setMaximumHeight(118)
         self.log.setObjectName("LogBox")
         bottom_layout.addWidget(self.log)
         main.addWidget(bottom)
@@ -278,16 +443,20 @@ class VoiceStudioQt(QMainWindow):
         self.setStyleSheet(
             """
             QMainWindow, QWidget {
-                background: #f4f6f8;
+                background: #f5f7fb;
                 color: #172033;
             }
             #Title {
-                font-size: 26px;
+                font-size: 25px;
                 font-weight: 700;
                 letter-spacing: 0px;
             }
             #Subtitle, #Muted {
                 color: #647084;
+            }
+            #FieldLabel {
+                color: #4f5f75;
+                font-weight: 600;
             }
             #SectionTitle {
                 font-size: 13px;
@@ -299,25 +468,43 @@ class VoiceStudioQt(QMainWindow):
                 border: 1px solid #dfe5ee;
                 border-radius: 8px;
             }
+            #OptionsContainer {
+                background: transparent;
+            }
+            #OptionsScroll {
+                background: transparent;
+                border: 0;
+            }
             QTextEdit, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QListWidget {
-                background: #fbfcfe;
-                border: 1px solid #d9e1ec;
+                background: #ffffff;
+                border: 1px solid #d5deeb;
                 border-radius: 6px;
-                padding: 7px;
+                padding: 6px 8px;
                 selection-background-color: #2563eb;
+            }
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+                min-height: 22px;
+            }
+            QComboBox {
+                padding-right: 28px;
+            }
+            QComboBox::drop-down {
+                width: 26px;
+                border: 0;
             }
             QTextEdit:focus, QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
                 border: 1px solid #2563eb;
+                background: #ffffff;
             }
             QPushButton, QToolButton {
-                background: #eef2f7;
-                border: 1px solid #d4dce8;
+                background: #f1f5f9;
+                border: 1px solid #d2dce9;
                 border-radius: 6px;
-                padding: 8px 12px;
+                padding: 7px 12px;
                 font-weight: 600;
             }
             QPushButton:hover, QToolButton:hover {
-                background: #e3eaf3;
+                background: #e6edf6;
             }
             QPushButton:disabled {
                 color: #8a94a6;
@@ -334,6 +521,27 @@ class VoiceStudioQt(QMainWindow):
             QCheckBox {
                 spacing: 8px;
             }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 10px;
+                margin: 2px 0 2px 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #c5cfdd;
+                border-radius: 5px;
+                min-height: 28px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #9aa8bc;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
+                border: 0;
+            }
+            QScrollBar:horizontal {
+                height: 0;
+                background: transparent;
+            }
             #LogBox {
                 background: #111827;
                 color: #dbeafe;
@@ -347,12 +555,19 @@ class VoiceStudioQt(QMainWindow):
     def _current_provider(self) -> Provider:
         return self.providers[self.provider_combo.currentText()]
 
+    def _current_output_suffix(self) -> str:
+        return export_suffix(self.format_combo.currentText(), self._current_provider())
+
     def _on_provider_changed(self) -> None:
         provider = self._current_provider()
         current = Path(self.output_edit.text() or str(APP_DIR / "voice_output.wav"))
-        self.output_edit.setText(str(current.with_suffix(provider.extension)))
+        self.output_edit.setText(str(current.with_suffix(self._current_output_suffix())))
         self._render_provider_options()
         self.statusBar().showMessage(f"Selected {provider.name}")
+
+    def _on_export_format_changed(self) -> None:
+        current = Path(self.output_edit.text() or str(APP_DIR / "voice_output.wav"))
+        self.output_edit.setText(str(current.with_suffix(self._current_output_suffix())))
 
     def _render_provider_options(self) -> None:
         while self.options_grid.count():
@@ -365,12 +580,18 @@ class VoiceStudioQt(QMainWindow):
         self.provider_note.setText(PROVIDER_NOTES.get(provider.name, ""))
         for row, field in enumerate(provider.fields):
             label = QLabel(field.label)
-            label.setObjectName("Muted")
+            label.setObjectName("FieldLabel")
+            label.setMinimumWidth(92)
             widget = self._field_widget(field)
             self.field_widgets[field.key] = widget
+            if field.key in {"voice", "voice_name"}:
+                self._apply_voice_favorites(widget, field)
+                if isinstance(widget, QComboBox):
+                    widget.currentTextChanged.connect(lambda _value: self._sync_favorite_button())
             self.options_grid.addWidget(label, row, 0)
             self.options_grid.addWidget(widget, row, 1)
         self.options_grid.setRowStretch(len(provider.fields), 1)
+        self._sync_favorite_button()
 
     def _field_widget(self, field: Field) -> QWidget:
         if field.kind == "choice":
@@ -378,6 +599,7 @@ class VoiceStudioQt(QMainWindow):
             combo.setEditable(True)
             combo.addItems(field.values)
             combo.setCurrentText(str(field.default))
+            combo.setMinimumHeight(36)
             return combo
         if field.kind == "bool":
             check = QCheckBox()
@@ -387,6 +609,9 @@ class VoiceStudioQt(QMainWindow):
             spin = QSpinBox()
             spin.setRange(int(field.minimum or 0), int(field.maximum or 999999))
             spin.setValue(int(field.default))
+            spin.setMinimumHeight(36)
+            spin.setAlignment(Qt.AlignRight)
+            spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
             return spin
         if field.kind == "float":
             spin = QDoubleSpinBox()
@@ -394,20 +619,27 @@ class VoiceStudioQt(QMainWindow):
             spin.setSingleStep(0.05)
             spin.setRange(float(field.minimum if field.minimum is not None else -999999), float(field.maximum or 999999))
             spin.setValue(float(field.default))
+            spin.setMinimumHeight(36)
+            spin.setAlignment(Qt.AlignRight)
+            spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
             return spin
         if field.kind == "file":
             row = QWidget()
             layout = QHBoxLayout(row)
             layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(8)
             edit = QLineEdit(str(field.default))
+            edit.setMinimumHeight(36)
             button = QToolButton()
             button.setText("...")
+            button.setFixedWidth(38)
             button.clicked.connect(lambda: self._browse_file(edit))
             layout.addWidget(edit, 1)
             layout.addWidget(button)
             row.setProperty("line_edit", edit)
             return row
         edit = QLineEdit(str(field.default))
+        edit.setMinimumHeight(36)
         return edit
 
     def _field_value(self, widget: QWidget) -> object:
@@ -425,6 +657,66 @@ class VoiceStudioQt(QMainWindow):
         if isinstance(edit, QLineEdit):
             return edit.text()
         return ""
+
+    def _voice_field_widget(self) -> QComboBox | None:
+        widget = self.field_widgets.get("voice") or self.field_widgets.get("voice_name")
+        return widget if isinstance(widget, QComboBox) else None
+
+    def _favorite_key(self) -> str:
+        return self._current_provider().name
+
+    def _read_favorites(self) -> dict[str, list[str]]:
+        if not FAVORITES_FILE.exists():
+            return {}
+        try:
+            data = json.loads(FAVORITES_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write_favorites(self, favorites: dict[str, list[str]]) -> None:
+        FAVORITES_FILE.write_text(json.dumps(favorites, indent=2), encoding="utf-8")
+
+    def _current_voice_value(self) -> str:
+        widget = self._voice_field_widget()
+        return widget.currentText().strip() if widget is not None else ""
+
+    def _apply_voice_favorites(self, widget: QWidget, field: Field) -> None:
+        if not isinstance(widget, QComboBox):
+            return
+        favorites = self._read_favorites().get(self._favorite_key(), [])
+        existing = [widget.itemText(index) for index in range(widget.count())]
+        for voice in reversed(favorites):
+            if voice and voice not in existing:
+                widget.insertItem(0, voice)
+        if favorites and favorites[0] in [widget.itemText(index) for index in range(widget.count())]:
+            widget.setCurrentText(favorites[0])
+        else:
+            widget.setCurrentText(str(field.default))
+
+    def _sync_favorite_button(self) -> None:
+        voice = self._current_voice_value()
+        has_voice = bool(voice)
+        favorites = self._read_favorites().get(self._favorite_key(), [])
+        self.preview_voice_button.setEnabled(True)
+        self.favorite_voice_button.setEnabled(has_voice)
+        self.favorite_voice_button.setText("Unfavorite Voice" if voice in favorites else "Favorite Voice")
+
+    def _toggle_favorite_voice(self) -> None:
+        voice = self._current_voice_value()
+        if not voice:
+            return
+        favorites = self._read_favorites()
+        provider_favorites = favorites.setdefault(self._favorite_key(), [])
+        if voice in provider_favorites:
+            provider_favorites.remove(voice)
+            self._append_log(f"Removed favorite voice: {voice}")
+        else:
+            provider_favorites.insert(0, voice)
+            self._append_log(f"Added favorite voice: {voice}")
+        favorites[self._favorite_key()] = provider_favorites[:20]
+        self._write_favorites(favorites)
+        self._sync_favorite_button()
 
     def _set_field_value(self, widget: QWidget, value: object) -> None:
         if isinstance(widget, QComboBox):
@@ -482,34 +774,55 @@ class VoiceStudioQt(QMainWindow):
             edit.setText(path)
 
     def _browse_output(self) -> None:
-        provider = self._current_provider()
+        suffix = self._current_output_suffix()
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save audio",
             self.output_edit.text(),
-            f"Audio (*{provider.extension});;All files (*.*)",
+            f"Audio (*{suffix});;All files (*.*)",
         )
         if path:
-            self.output_edit.setText(path)
+            self.output_edit.setText(str(Path(path).with_suffix(suffix)))
 
     def _start_generate(self) -> None:
         text = clean_text(self.text_edit.toPlainText())
         if not text:
             QMessageBox.warning(self, "Missing text", "Nhap noi dung can tao voice.")
             return
-        output = Path(self.output_edit.text()).expanduser()
+        output = Path(self.output_edit.text()).expanduser().with_suffix(self._current_output_suffix())
+        self.output_edit.setText(str(output))
         if not output.parent.exists():
             QMessageBox.warning(self, "Invalid output", "Thu muc output khong ton tai.")
             return
         provider = self._current_provider()
         self.generate_button.setEnabled(False)
         self.statusBar().showMessage(f"Generating with {provider.name}...")
-        self.worker = GenerateWorker(provider, text, output, self._collect_options())
+        self.worker = GenerateWorker(
+            provider,
+            text,
+            output,
+            self._collect_options(),
+            self.format_combo.currentText(),
+            self.bitrate_combo.currentText(),
+            self.merge_segments_check.isChecked(),
+        )
         self.worker.log.connect(self._append_log)
         self.worker.finished_ok.connect(self._on_generate_done)
         self.worker.failed.connect(self._on_generate_failed)
         self.worker.finished.connect(lambda: self.generate_button.setEnabled(True))
         self.worker.start()
+
+    def _preview_voice(self) -> None:
+        provider = self._current_provider()
+        output = APP_DIR / f"voice_preview{provider.extension}"
+        self.preview_voice_button.setEnabled(False)
+        self.statusBar().showMessage(f"Previewing {provider.name}...")
+        self.preview_worker = GenerateWorker(provider, PREVIEW_TEXT, output, self._collect_options())
+        self.preview_worker.log.connect(self._append_log)
+        self.preview_worker.finished_ok.connect(self._on_preview_done)
+        self.preview_worker.failed.connect(self._on_preview_failed)
+        self.preview_worker.finished.connect(lambda: self.preview_voice_button.setEnabled(True))
+        self.preview_worker.start()
 
     def _on_generate_done(self, output: str) -> None:
         self.last_output = Path(output)
@@ -524,8 +837,22 @@ class VoiceStudioQt(QMainWindow):
         self.statusBar().showMessage("Failed")
         QMessageBox.critical(self, "Generate failed", error)
 
+    def _on_preview_done(self, output: str) -> None:
+        self.preview_output = Path(output)
+        self._append_log(f"Preview ready: {output}")
+        self.statusBar().showMessage("Preview ready")
+        self._play_path(self.preview_output)
+
+    def _on_preview_failed(self, error: str) -> None:
+        self._append_log(f"Preview error: {error}")
+        self.statusBar().showMessage("Preview failed")
+        QMessageBox.critical(self, "Preview failed", error)
+
     def _play_audio(self) -> None:
         output = self._action_output()
+        self._play_path(output)
+
+    def _play_path(self, output: Path) -> None:
         if not output.exists():
             QMessageBox.warning(self, "Missing audio", "Chua co file audio de phat.")
             return
